@@ -13,11 +13,12 @@ import (
 )
 
 var defaults = Configuration{
-	DbUser: "db_user",
-	DbPassword: "db_pw",
-	DbName: "bd_name",
-	PkgName: "DbStructs",
-	TagLabel: "db",
+	DbUser:      "db_user",
+	DbPassword:  "db_pw",
+	DbName:      "bd_name",
+	PkgName:     "DbStructs",
+	TagLabel:    "db",
+	TagLabel2nd: "json",
 }
 
 var config Configuration
@@ -29,7 +30,8 @@ type Configuration struct {
 	// PkgName gives name of the package using the stucts
 	PkgName string `json:"pkg_name"`
 	// TagLabel produces tags commonly used to match database field names with Go struct members
-	TagLabel string `json:"tag_label"`
+	TagLabel    string `json:"tag_label"`
+	TagLabel2nd string `json:"tag_label_2nd"`
 }
 
 type ColumnSchema struct {
@@ -44,7 +46,7 @@ type ColumnSchema struct {
 	ColumnKey              string
 }
 
-func writeStructs(schemas []ColumnSchema) (int, error) {
+func writeStructs(schemas []ColumnSchema, conn *sql.DB) (int, error) {
 	file, err := os.Create("db_structs.go")
 	if err != nil {
 		log.Fatal(err)
@@ -61,6 +63,7 @@ func writeStructs(schemas []ColumnSchema) (int, error) {
 
 		if cs.TableName != currentTable {
 			if currentTable != "" {
+				out = out + "\n" + getTableCRUDStatements(currentTable, conn) + "\n"
 				out = out + "}\n\n"
 			}
 			out = out + "type " + formatName(cs.TableName) + " struct{\n"
@@ -70,18 +73,25 @@ func writeStructs(schemas []ColumnSchema) (int, error) {
 		if requiredImport != "" {
 			neededImports[requiredImport] = true
 		}
+		if config.TagLabel2nd == "json" {
+			neededImports["encoding/json"] = true
+		}
 
 		if err != nil {
 			log.Fatal(err)
 		}
 		out = out + "\t" + formatName(cs.ColumnName) + " " + goType
+		out = out + "\t`origin:\"" + cs.ColumnType + "\" "
 		if len(config.TagLabel) > 0 {
-			out = out + "\t`" + config.TagLabel + ":\"" + cs.ColumnName + "\"`"
+			out = out + config.TagLabel + ":\"" + cs.ColumnName + "\""
 		}
-		out = out + "\n"
+		if len(config.TagLabel2nd) > 0 {
+			out = out + " " + config.TagLabel2nd + ":\"" + cs.ColumnName + "\""
+		}
+		out = out + "`\n"
 		currentTable = cs.TableName
-
 	}
+
 	out = out + "}"
 
 	// Now add the header section
@@ -101,19 +111,16 @@ func writeStructs(schemas []ColumnSchema) (int, error) {
 	return totalBytes, nil
 }
 
-func getSchema() []ColumnSchema {
-	conn, err := sql.Open("mysql", config.DbUser+":"+config.DbPassword+"@/information_schema")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer conn.Close()
+
+func getSchema(conn *sql.DB) []ColumnSchema {
+
+
 	q := "SELECT TABLE_NAME, COLUMN_NAME, IS_NULLABLE, DATA_TYPE, " +
 		"CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, COLUMN_TYPE, " +
 		"COLUMN_KEY FROM COLUMNS WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, ORDINAL_POSITION"
 	rows, err := conn.Query(q, config.DbName)
-	if err != nil {
-		log.Fatal(err)
-	}
+	if err != nil {log.Fatal(err)}
+
 	columns := []ColumnSchema{}
 	for rows.Next() {
 		cs := ColumnSchema{}
@@ -129,6 +136,56 @@ func getSchema() []ColumnSchema {
 		log.Fatal(err)
 	}
 	return columns
+}
+
+func getTableCRUDStatements(TableName string, conn *sql.DB) string {
+	var total_output string = ""
+	var output string = ""
+
+	q := "select concat('SELECT ',group_concat(c.column_name),' FROM ',table_name) from information_schema.columns c " +
+		"where c.table_name=? and c.table_schema=? order by c.ORDINAL_POSITION"
+	if err := conn.QueryRow(q, TableName, config.DbName).Scan(&output); err != nil {
+		log.Fatal(err)
+	}
+	total_output = total_output + "// Select all columns: " + output + "\n"
+
+	q = "SELECT concat('SELECT * FROM ',table_name, concat(' WHERE ',replace(group_concat(column_name)," +
+		"',',' = ? AND '),' = ?')) FROM INFORMATION_SCHEMA.STATISTICS WHERE table_name=? and TABLE_SCHEMA = ? " +
+		"group by index_name"
+	rows, err := conn.Query(q, TableName, config.DbName)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for rows.Next() {
+
+		err = rows.Scan(&output)
+		if err != nil {
+			log.Fatal(err)
+		}
+		total_output = total_output + "// Select all by key: " + output + "\n"
+	}
+	if err = rows.Err(); err != nil { log.Fatal(err) }
+
+	q = "select concat('INSERT INTO ',table_name, '(',group_concat(c.column_name),') VALUES " +
+		"(',group_concat('?'),')') from columns c where c.table_name=? and c.table_schema=? " +
+		"order by c.ORDINAL_POSITION"
+	if err = conn.QueryRow(q, TableName, config.DbName).Scan(&output); err != nil {
+		log.Fatal(err)
+	}
+
+	total_output = total_output + "// Insert with all columns: " + output + "\n"
+
+	q = "select concat('UPDATE ',table_schema,'.',table_name,' SET ' ,group_concat(c.column_name,'=?')," +
+		"' WHERE ',ifnull((SELECT concat(replace(group_concat(column_name),',',' = ? AND '),' = ?') as tail " +
+		"FROM INFORMATION_SCHEMA.STATISTICS WHERE table_name=? and TABLE_SCHEMA = ? " +
+		"and INDEX_NAME='PRIMARY' group by index_name),'')) from columns c " +
+		"where c.table_name=? and c.table_schema=? order by c.ORDINAL_POSITION;"
+	if err = conn.QueryRow(q, TableName, config.DbName, TableName, config.DbName).Scan(&output); err != nil {
+		log.Fatal(err)
+	}
+	total_output = total_output + "// Update all columns by primary key: " + output + "\n"
+
+	return total_output
 }
 
 func formatName(name string) string {
@@ -160,7 +217,7 @@ func goType(col *ColumnSchema) (string, string, error) {
 		gt = "[]byte"
 	case "date", "time", "datetime", "timestamp":
 		gt, requiredImport = "time.Time", "time"
-	case "bit", "tinyint", "smallint", "int", "mediumint", "bigint":
+	case "tinyint", "smallint", "bit", "int", "mediumint", "bigint":
 		if col.IsNullable == "YES" {
 			gt = "sql.NullInt64"
 		} else {
@@ -184,7 +241,7 @@ var configFile = flag.String("json", "", "Config file")
 
 func main() {
 	flag.Parse()
-	
+
 	if len(*configFile) > 0 {
 		f, err := os.Open(*configFile)
 		if err != nil {
@@ -197,11 +254,16 @@ func main() {
 	} else {
 		config = defaults
 	}
-
-	columns := getSchema()
-	bytes, err := writeStructs(columns)
+	conn, err := sql.Open("mysql", config.DbUser+":"+config.DbPassword+"@/information_schema")
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	columns := getSchema(conn)
+	bytes, err := writeStructs(columns, conn)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
 	fmt.Printf("Ok %d\n", bytes)
 }
